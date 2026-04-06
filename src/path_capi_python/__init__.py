@@ -1,16 +1,20 @@
 """PATH C API wrapper package."""
 
 from .loader import PATHLoader, PATHLibraryError, PATHRuntime
-from .mcp import LinearMCPResult, solve_linear_mcp
-from .pyomo_adapter import LinearCallbackData, PyomoMCPAdapter, PyomoModelSummary
+from .mcp import JacobianStructure, LinearMCPResult, NonlinearMCPResult, solve_linear_mcp, solve_nonlinear_mcp
+from .pyomo_adapter import LinearCallbackData, NonlinearCallbackData, PyomoMCPAdapter, PyomoModelSummary
 
 __all__ = [
-	"PATHLoader",
-	"PATHLibraryError",
-	"PATHRuntime",
-	"LinearMCPResult",
-	"solve_linear_mcp",
-	"PyomoMCPAdapter",
-	"PyomoModelSummary",
-	"LinearCallbackData",
+    "PATHLoader",
+    "PATHLibraryError",
+    "PATHRuntime",
+    "JacobianStructure",
+    "LinearMCPResult",
+    "NonlinearMCPResult",
+    "solve_linear_mcp",
+    "solve_nonlinear_mcp",
+    "PyomoMCPAdapter",
+    "PyomoModelSummary",
+    "LinearCallbackData",
+    "NonlinearCallbackData",
 ]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 from dataclasses import dataclass
+from typing import Callable, Sequence
 
 from .loader import PATHRuntime
 
@@ -80,6 +81,41 @@ class Information(ctypes.Structure):
     ]
 
 
+@dataclass(frozen=True)
+class JacobianStructure:
+    """Sparse Jacobian structure in PATH's column-compressed callback format."""
+
+    col_starts: list[int]
+    col_lengths: list[int]
+    row_indices: list[int]
+
+    @property
+    def nnz(self) -> int:
+        return len(self.row_indices)
+
+    @classmethod
+    def from_column_rows(cls, column_rows: Sequence[Sequence[int]]) -> "JacobianStructure":
+        col_starts: list[int] = []
+        col_lengths: list[int] = []
+        row_indices: list[int] = []
+        cursor = 1
+
+        for rows in column_rows:
+            col_starts.append(cursor)
+            col_lengths.append(len(rows))
+            for row in rows:
+                if row < 1:
+                    raise ValueError("Jacobian row indices must be 1-based positive integers")
+                row_indices.append(int(row))
+                cursor += 1
+
+        return cls(
+            col_starts=col_starts,
+            col_lengths=col_lengths,
+            row_indices=row_indices,
+        )
+
+
 @dataclass
 class LinearMCPResult:
     termination_code: int
@@ -89,81 +125,18 @@ class LinearMCPResult:
     minor_iterations: int
 
 
-def solve_linear_mcp(
-    runtime: PATHRuntime,
-    M: list[list[float]],
-    q: list[float],
-    lb: list[float],
-    ub: list[float],
-    x0: list[float],
-    *,
-    output: bool = True,
-) -> LinearMCPResult:
-    n = len(q)
-    if not (len(M) == n and all(len(row) == n for row in M)):
-        raise ValueError("M must be square with size len(q)")
-    if not (len(lb) == n and len(ub) == n and len(x0) == n):
-        raise ValueError("lb, ub, and x0 must have length len(q)")
+@dataclass
+class NonlinearMCPResult:
+    termination_code: int
+    x: list[float]
+    residual: float
+    major_iterations: int
+    minor_iterations: int
+    function_evaluations: int
+    jacobian_evaluations: int
 
-    entries: list[tuple[int, int, float]] = []
-    col_starts: list[int] = []
-    col_lens: list[int] = []
-    cursor = 1
-    for j in range(n):
-        col_starts.append(cursor)
-        count = 0
-        for i in range(n):
-            val = float(M[i][j])
-            if val != 0.0:
-                entries.append((i + 1, j + 1, val))
-                count += 1
-                cursor += 1
-        col_lens.append(count)
-    nnz = len(entries)
 
-    c_lb = (ctypes.c_double * n)(*map(float, lb))
-    c_ub = (ctypes.c_double * n)(*map(float, ub))
-    c_x0 = (ctypes.c_double * n)(*map(float, x0))
-    c_q = (ctypes.c_double * n)(*map(float, q))
-
-    @CB_PROBLEM_SIZE
-    def _problem_size(_id, size_ptr, nnz_ptr):
-        size_ptr[0] = n
-        nnz_ptr[0] = nnz
-
-    @CB_BOUNDS
-    def _bounds(_id, size, x_ptr, l_ptr, u_ptr):
-        for i in range(size):
-            x_ptr[i] = c_x0[i]
-            l_ptr[i] = c_lb[i]
-            u_ptr[i] = c_ub[i]
-
-    @CB_FUNCTION
-    def _function(_id, size, x_ptr, f_ptr):
-        for i in range(size):
-            total = c_q[i]
-            for j in range(size):
-                total += M[i][j] * x_ptr[j]
-            f_ptr[i] = total
-        return 0
-
-    @CB_JACOBIAN
-    def _jacobian(_id, size, x_ptr, wantf, f_ptr, nnz_ptr, col_ptr, len_ptr, row_ptr, data_ptr):
-        if wantf > 0:
-            _function(_id, size, x_ptr, f_ptr)
-        nnz_ptr[0] = nnz
-        for j in range(size):
-            col_ptr[j] = col_starts[j]
-            len_ptr[j] = col_lens[j]
-        for k, (row_i, _col_j, val) in enumerate(entries):
-            row_ptr[k] = row_i
-            data_ptr[k] = val
-        return 0
-
-    # Keep callback references alive for the full solve call.
-    callbacks = (_problem_size, _bounds, _function, _jacobian)
-
-    path = runtime.path
+def _configure_path_functions(path: object) -> None:
     path.Options_Create.restype = ctypes.c_void_p
     path.Options_Destroy.argtypes = [ctypes.c_void_p]
     path.Path_AddOptions.argtypes = [ctypes.c_void_p]
@@ -179,6 +152,78 @@ def solve_linear_mcp(
     path.Path_Solve.restype = ctypes.c_int
     path.MCP_GetX.argtypes = [ctypes.c_void_p]
     path.MCP_GetX.restype = ctypes.POINTER(ctypes.c_double)
+
+
+def solve_nonlinear_mcp(
+    runtime: PATHRuntime,
+    *,
+    n: int,
+    lb: Sequence[float],
+    ub: Sequence[float],
+    x0: Sequence[float],
+    callback_f: Callable[[Sequence[float]], Sequence[float]],
+    callback_jac: Callable[[Sequence[float]], Sequence[float]],
+    jacobian_structure: JacobianStructure,
+    output: bool = True,
+) -> NonlinearMCPResult:
+    if n <= 0:
+        raise ValueError("n must be positive")
+    if not (len(lb) == n and len(ub) == n and len(x0) == n):
+        raise ValueError("lb, ub, and x0 must have length n")
+    if len(jacobian_structure.col_starts) != n or len(jacobian_structure.col_lengths) != n:
+        raise ValueError("jacobian_structure must define one start and length per variable")
+
+    c_lb = [float(value) for value in lb]
+    c_ub = [float(value) for value in ub]
+    c_x0 = [float(value) for value in x0]
+    nnz = jacobian_structure.nnz
+
+    def _read_x(size: int, x_ptr: ctypes.POINTER(ctypes.c_double)) -> list[float]:
+        return [float(x_ptr[i]) for i in range(size)]
+
+    @CB_PROBLEM_SIZE
+    def _problem_size(_id, size_ptr, nnz_ptr):
+        size_ptr[0] = n
+        nnz_ptr[0] = nnz
+
+    @CB_BOUNDS
+    def _bounds(_id, size, x_ptr, l_ptr, u_ptr):
+        for i in range(size):
+            x_ptr[i] = c_x0[i]
+            l_ptr[i] = c_lb[i]
+            u_ptr[i] = c_ub[i]
+
+    @CB_FUNCTION
+    def _function(_id, size, x_ptr, f_ptr):
+        values = list(callback_f(_read_x(size, x_ptr)))
+        if len(values) != size:
+            raise ValueError(f"callback_f returned {len(values)} values, expected {size}")
+        for i, value in enumerate(values):
+            f_ptr[i] = float(value)
+        return 0
+
+    @CB_JACOBIAN
+    def _jacobian(_id, size, x_ptr, wantf, f_ptr, nnz_ptr, col_ptr, len_ptr, row_ptr, data_ptr):
+        if wantf > 0:
+            _function(_id, size, x_ptr, f_ptr)
+
+        values = list(callback_jac(_read_x(size, x_ptr)))
+        if len(values) != nnz:
+            raise ValueError(f"callback_jac returned {len(values)} values, expected {nnz}")
+
+        nnz_ptr[0] = nnz
+        for j in range(size):
+            col_ptr[j] = jacobian_structure.col_starts[j]
+            len_ptr[j] = jacobian_structure.col_lengths[j]
+        for k, row in enumerate(jacobian_structure.row_indices):
+            row_ptr[k] = row
+            data_ptr[k] = float(values[k])
+        return 0
+
+    callbacks = (_problem_size, _bounds, _function, _jacobian)
+
+    path = runtime.path
+    _configure_path_functions(path)
 
     options = path.Options_Create()
     if not options:
@@ -223,10 +268,61 @@ def solve_linear_mcp(
 
     _ = callbacks
 
-    return LinearMCPResult(
+    return NonlinearMCPResult(
         termination_code=term,
         x=x_sol,
         residual=float(info.residual),
         major_iterations=int(info.major_iterations),
         minor_iterations=int(info.minor_iterations),
+        function_evaluations=int(info.function_evaluations),
+        jacobian_evaluations=int(info.jacobian_evaluations),
+    )
+
+
+def solve_linear_mcp(
+    runtime: PATHRuntime,
+    M: Sequence[Sequence[float]],
+    q: Sequence[float],
+    lb: Sequence[float],
+    ub: Sequence[float],
+    x0: Sequence[float],
+    *,
+    output: bool = True,
+) -> LinearMCPResult:
+    n = len(q)
+    if not (len(M) == n and all(len(row) == n for row in M)):
+        raise ValueError("M must be square with size len(q)")
+    if not (len(lb) == n and len(ub) == n and len(x0) == n):
+        raise ValueError("lb, ub, and x0 must have length len(q)")
+
+    entries: list[float] = []
+    column_rows: list[list[int]] = [[] for _ in range(n)]
+    for j in range(n):
+        for i in range(n):
+            value = float(M[i][j])
+            if value != 0.0:
+                column_rows[j].append(i + 1)
+                entries.append(value)
+
+    result = solve_nonlinear_mcp(
+        runtime,
+        n=n,
+        lb=lb,
+        ub=ub,
+        x0=x0,
+        callback_f=lambda x: [
+            float(q[i]) + sum(float(M[i][j]) * float(x[j]) for j in range(n))
+            for i in range(n)
+        ],
+        callback_jac=lambda _x: entries,
+        jacobian_structure=JacobianStructure.from_column_rows(column_rows),
+        output=output,
+    )
+
+    return LinearMCPResult(
+        termination_code=result.termination_code,
+        x=result.x,
+        residual=result.residual,
+        major_iterations=result.major_iterations,
+        minor_iterations=result.minor_iterations,
     )

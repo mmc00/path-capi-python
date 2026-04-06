@@ -33,8 +33,28 @@ Users are responsible for obtaining and complying with PATH licensing requiremen
 
 - PATH shared library loader implemented (`Path_Version`, `Path_CheckLicense`).
 - Minimal linear MCP solve implemented through C callbacks.
+- Nonlinear MCP solve implemented through residual/Jacobian callbacks with fixed sparsity.
 - Example script available at `examples/minimal_mcp.py`.
 - Pyomo adapter scaffold started (`PyomoMCPAdapter`) for model introspection.
+
+## Nonlinear MCP API
+
+Use `solve_nonlinear_mcp` when the residual is not available in `M, q` form.
+Provide:
+
+- bounds and start point (`lb`, `ub`, `x0`)
+- a residual callback `callback_f(x) -> F(x)`
+- a Jacobian callback `callback_jac(x) -> values`
+- a fixed sparsity pattern via `JacobianStructure`
+
+The Jacobian values must be returned in the same order implied by the column-compressed structure.
+
+For Pyomo workflows, `PyomoMCPAdapter` also provides:
+
+- `build_nonlinear_callbacks(...)`
+- `build_nonlinear_from_equality_constraints(...)`
+- `solve_nonlinear(...)`
+- `solve_nonlinear_from_equality_constraints(...)`
 
 ## Running Tests
 
