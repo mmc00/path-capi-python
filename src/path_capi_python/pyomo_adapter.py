@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
+
+from .loader import PATHRuntime
+from .mcp import JacobianStructure, NonlinearMCPResult, solve_nonlinear_mcp
 
 
 @dataclass(frozen=True)
@@ -19,6 +22,17 @@ class LinearCallbackData:
     lb: list[float]
     ub: list[float]
     x0: list[float]
+
+
+@dataclass(frozen=True)
+class NonlinearCallbackData:
+    variable_names: list[str]
+    lb: list[float]
+    ub: list[float]
+    x0: list[float]
+    jacobian_structure: JacobianStructure
+    callback_f: Callable[[Sequence[float]], list[float]]
+    callback_jac: Callable[[Sequence[float]], list[float]]
 
 
 class PyomoMCPAdapter:
@@ -137,6 +151,92 @@ class PyomoMCPAdapter:
             x0=x0,
         )
 
+    def build_nonlinear_callbacks(
+        self,
+        model: Any,
+        *,
+        expressions: Sequence[Any],
+        variables: Sequence[Any] | None = None,
+    ) -> NonlinearCallbackData:
+        """Build nonlinear residual and Jacobian callbacks from Pyomo expressions."""
+        from pyomo.environ import Var, value
+        from pyomo.core.expr.calculus.derivatives import Modes, differentiate
+
+        def _is_zero_derivative(expr: Any) -> bool:
+            if isinstance(expr, (int, float)):
+                return float(expr) == 0.0
+            if hasattr(expr, "is_constant") and expr.is_constant():
+                return float(value(expr)) == 0.0
+            return False
+
+        if variables is None:
+            variables = sorted(
+                model.component_data_objects(Var, active=True, descend_into=True),
+                key=lambda v: v.name,
+            )
+
+        var_list = list(variables)
+        if not var_list:
+            raise ValueError("No variables provided/found for callback construction")
+
+        expr_list = list(expressions)
+        n = len(var_list)
+        if len(expr_list) != n:
+            raise ValueError(
+                "Expected one expression per variable. "
+                f"Got {len(expr_list)} expressions for {n} variables."
+            )
+
+        inf = 1.0e20
+        lb: list[float] = []
+        ub: list[float] = []
+        x0: list[float] = []
+
+        for var in var_list:
+            lo = value(var.lb) if var.has_lb() else -inf
+            up = value(var.ub) if var.has_ub() else inf
+            st = value(var) if var.value is not None else 0.0
+            lb.append(float(lo))
+            ub.append(float(up))
+            x0.append(float(st))
+
+        jacobian_exprs: list[tuple[int, Any]] = []
+        column_rows: list[list[int]] = [[] for _ in range(n)]
+
+        for j, var in enumerate(var_list):
+            for i, expr in enumerate(expr_list):
+                derivative = differentiate(expr, wrt=var, mode=Modes.reverse_symbolic)
+                if _is_zero_derivative(derivative):
+                    continue
+                column_rows[j].append(i + 1)
+                jacobian_exprs.append((i, derivative))
+
+        structure = JacobianStructure.from_column_rows(column_rows)
+
+        def _assign_values(x: Sequence[float]) -> None:
+            if len(x) != n:
+                raise ValueError(f"Expected {n} values, got {len(x)}")
+            for var, val in zip(var_list, x):
+                var.set_value(float(val), skip_validation=True)
+
+        def _callback_f(x: Sequence[float]) -> list[float]:
+            _assign_values(x)
+            return [float(value(expr)) for expr in expr_list]
+
+        def _callback_jac(x: Sequence[float]) -> list[float]:
+            _assign_values(x)
+            return [float(value(derivative)) for _i, derivative in jacobian_exprs]
+
+        return NonlinearCallbackData(
+            variable_names=[v.name for v in var_list],
+            lb=lb,
+            ub=ub,
+            x0=x0,
+            jacobian_structure=structure,
+            callback_f=_callback_f,
+            callback_jac=_callback_jac,
+        )
+
     def build_from_equality_constraints(
         self,
         model: Any,
@@ -185,3 +285,95 @@ class PyomoMCPAdapter:
             ordered_vars = list(variables)
 
         return self.build_callbacks(model, expressions=expressions, variables=ordered_vars)
+
+    def build_nonlinear_from_equality_constraints(
+        self,
+        model: Any,
+        *,
+        constraints: Sequence[Any],
+        variables: Sequence[Any] | None = None,
+    ) -> NonlinearCallbackData:
+        """Build nonlinear callbacks from Pyomo equality constraints."""
+        from pyomo.environ import value
+        from pyomo.repn.standard_repn import generate_standard_repn
+
+        con_list = list(constraints)
+        if not con_list:
+            raise ValueError("No constraints provided")
+
+        expressions: list[Any] = []
+        inferred_vars_by_name: dict[str, Any] = {}
+
+        for con in con_list:
+            if not con.active:
+                continue
+            if not con.equality:
+                raise ValueError(f"Constraint {con.name} is not an equality")
+
+            rhs = value(con.lower)
+            expr = con.body - rhs
+            expressions.append(expr)
+
+            if variables is None:
+                repn = generate_standard_repn(expr, compute_values=False)
+                for var in repn.linear_vars or []:
+                    inferred_vars_by_name[var.name] = var
+                for var in getattr(repn, "nonlinear_vars", None) or []:
+                    inferred_vars_by_name[var.name] = var
+
+        if variables is None:
+            ordered_vars = [inferred_vars_by_name[name] for name in sorted(inferred_vars_by_name.keys())]
+        else:
+            ordered_vars = list(variables)
+
+        return self.build_nonlinear_callbacks(model, expressions=expressions, variables=ordered_vars)
+
+    def solve_nonlinear(
+        self,
+        runtime: PATHRuntime,
+        model: Any,
+        *,
+        expressions: Sequence[Any],
+        variables: Sequence[Any] | None = None,
+        output: bool = True,
+    ) -> NonlinearMCPResult:
+        """Build nonlinear callbacks from expressions and solve with PATH."""
+        data = self.build_nonlinear_callbacks(model, expressions=expressions, variables=variables)
+        return solve_nonlinear_mcp(
+            runtime,
+            n=len(data.variable_names),
+            lb=data.lb,
+            ub=data.ub,
+            x0=data.x0,
+            callback_f=data.callback_f,
+            callback_jac=data.callback_jac,
+            jacobian_structure=data.jacobian_structure,
+            output=output,
+        )
+
+    def solve_nonlinear_from_equality_constraints(
+        self,
+        runtime: PATHRuntime,
+        model: Any,
+        *,
+        constraints: Sequence[Any],
+        variables: Sequence[Any] | None = None,
+        output: bool = True,
+    ) -> NonlinearMCPResult:
+        """Build nonlinear callbacks from equality constraints and solve with PATH."""
+        data = self.build_nonlinear_from_equality_constraints(
+            model,
+            constraints=constraints,
+            variables=variables,
+        )
+        return solve_nonlinear_mcp(
+            runtime,
+            n=len(data.variable_names),
+            lb=data.lb,
+            ub=data.ub,
+            x0=data.x0,
+            callback_f=data.callback_f,
+            callback_jac=data.callback_jac,
+            jacobian_structure=data.jacobian_structure,
+            output=output,
+        )
