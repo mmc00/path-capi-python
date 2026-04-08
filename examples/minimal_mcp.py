@@ -1,24 +1,11 @@
 from __future__ import annotations
 
-import os
-from pathlib import Path
-
 from path_capi_python import PATHLoader
 from path_capi_python.mcp import solve_linear_mcp
 
 
-def _required_env(name: str) -> str:
-    value = os.environ.get(name)
-    if not value:
-        raise RuntimeError(f"Missing required environment variable: {name}")
-    return value
-
-
 def main() -> None:
-    path_lib = Path(_required_env("PATH_CAPI_LIBPATH"))
-    lusol_lib = Path(_required_env("PATH_CAPI_LIBLUSOL"))
-
-    loader = PATHLoader(path_lib=path_lib, lusol_lib=lusol_lib)
+    loader = PATHLoader.from_environment()
     runtime = loader.load()
 
     print("PATH version:", loader.version(runtime))

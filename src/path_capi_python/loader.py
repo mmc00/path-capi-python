@@ -21,9 +21,22 @@ class PATHRuntime:
 class PATHLoader:
     """Thin loader for PATH C API shared libraries."""
 
+    PATH_LIB_ENV = "PATH_CAPI_LIBPATH"
+    LUSOL_LIB_ENV = "PATH_CAPI_LIBLUSOL"
+
     def __init__(self, path_lib: str | os.PathLike[str], lusol_lib: str | os.PathLike[str] | None = None):
         self.path_lib = Path(path_lib).expanduser().resolve()
         self.lusol_lib = Path(lusol_lib).expanduser().resolve() if lusol_lib else None
+
+    @classmethod
+    def from_environment(cls) -> "PATHLoader":
+        path_lib = os.environ.get(cls.PATH_LIB_ENV)
+        if not path_lib:
+            raise PATHLibraryError(f"Missing required environment variable: {cls.PATH_LIB_ENV}")
+        return cls(
+            path_lib=path_lib,
+            lusol_lib=os.environ.get(cls.LUSOL_LIB_ENV),
+        )
 
     def load(self) -> PATHRuntime:
         if not self.path_lib.exists():

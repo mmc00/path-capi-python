@@ -32,10 +32,33 @@ Users are responsible for obtaining and complying with PATH licensing requiremen
 ## Current Status
 
 - PATH shared library loader implemented (`Path_Version`, `Path_CheckLicense`).
+- PATH runtime can be configured directly from `PATH_CAPI_LIBPATH` and `PATH_CAPI_LIBLUSOL`.
 - Minimal linear MCP solve implemented through C callbacks.
 - Nonlinear MCP solve implemented through residual/Jacobian callbacks with fixed sparsity.
-- Example script available at `examples/minimal_mcp.py`.
-- Pyomo adapter scaffold started (`PyomoMCPAdapter`) for model introspection.
+- Example scripts available at `examples/check_runtime.py` and `examples/minimal_mcp.py`.
+- Pyomo adapter can build callbacks from equality constraints and write solutions back to model variables.
+- Pyomo solver plugin `path_capi_bridge` is registered through `SolverFactory`.
+
+## Runtime Setup
+
+Point the wrapper at your local PATH shared libraries:
+
+```bash
+export PATH_CAPI_LIBPATH=/absolute/path/to/libpath.dylib
+export PATH_CAPI_LIBLUSOL=/absolute/path/to/liblusol.dylib
+```
+
+Verify the runtime first:
+
+```bash
+PYTHONPATH=src python3 examples/check_runtime.py
+```
+
+Then run the minimal MCP example:
+
+```bash
+PYTHONPATH=src python3 examples/minimal_mcp.py
+```
 
 ## Nonlinear MCP API
 
@@ -55,6 +78,33 @@ For Pyomo workflows, `PyomoMCPAdapter` also provides:
 - `build_nonlinear_from_equality_constraints(...)`
 - `solve_nonlinear(...)`
 - `solve_nonlinear_from_equality_constraints(...)`
+
+## Pyomo Solver Plugin
+
+The package registers a native Pyomo solver plugin named `path_capi_bridge`.
+It currently targets square systems of active equality constraints and routes them through the PATH C API bridge.
+
+```python
+import path_capi_python
+from pyomo.environ import ConcreteModel, Constraint, SolverFactory, Var
+
+model = ConcreteModel()
+model.x1 = Var(initialize=1.5)
+model.x2 = Var(initialize=0.5)
+model.c1 = Constraint(expr=model.x1**2 - 3.0 == 0.0)
+model.c2 = Constraint(expr=model.x1 + 2.0 * model.x2 - 2.0 == 0.0)
+
+solver = SolverFactory("path_capi_bridge")
+results = solver.solve(model, output=False)
+```
+
+Optional keyword arguments to `solve(...)`:
+
+- `runtime`: preloaded `PATHRuntime`
+- `path_lib`, `lusol_lib`: explicit shared-library paths
+- `constraints`: ordered equality constraints to use
+- `variables`: ordered variables to use
+- `output`: enable or suppress PATH output
 
 ## Running Tests
 
