@@ -339,7 +339,7 @@ class PyomoMCPAdapter:
     ) -> NonlinearMCPResult:
         """Build nonlinear callbacks from expressions and solve with PATH."""
         data = self.build_nonlinear_callbacks(model, expressions=expressions, variables=variables)
-        return solve_nonlinear_mcp(
+        result = solve_nonlinear_mcp(
             runtime,
             n=len(data.variable_names),
             lb=data.lb,
@@ -350,6 +350,8 @@ class PyomoMCPAdapter:
             jacobian_structure=data.jacobian_structure,
             output=output,
         )
+        self._write_solution(model, result.x, variables=variables)
+        return result
 
     def solve_nonlinear_from_equality_constraints(
         self,
@@ -366,7 +368,7 @@ class PyomoMCPAdapter:
             constraints=constraints,
             variables=variables,
         )
-        return solve_nonlinear_mcp(
+        result = solve_nonlinear_mcp(
             runtime,
             n=len(data.variable_names),
             lb=data.lb,
@@ -377,3 +379,29 @@ class PyomoMCPAdapter:
             jacobian_structure=data.jacobian_structure,
             output=output,
         )
+        self._write_solution(model, result.x, variables=variables)
+        return result
+
+    def _write_solution(
+        self,
+        model: Any,
+        values: Sequence[float],
+        *,
+        variables: Sequence[Any] | None = None,
+    ) -> None:
+        from pyomo.environ import Var
+
+        if variables is None:
+            variables = sorted(
+                model.component_data_objects(Var, active=True, descend_into=True),
+                key=lambda v: v.name,
+            )
+
+        var_list = list(variables)
+        if len(var_list) != len(values):
+            raise ValueError(
+                f"Expected {len(var_list)} solution values for Pyomo write-back, got {len(values)}"
+            )
+
+        for var, value in zip(var_list, values):
+            var.set_value(float(value), skip_validation=True)

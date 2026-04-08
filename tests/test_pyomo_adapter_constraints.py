@@ -75,5 +75,7 @@ def test_solve_nonlinear_from_equality_constraints() -> None:
     assert result.termination_code == 1
     assert result.x == [1.0, 2.0]
     assert result.residual == 1.25e-9
+    assert model.x1.value == pytest.approx(1.0)
+    assert model.x2.value == pytest.approx(2.0)
     assert fake_path.last_function_values == [-0.75, 0.5]
     assert fake_path.last_jacobian_values == [3.0, 1.0, 2.0]
