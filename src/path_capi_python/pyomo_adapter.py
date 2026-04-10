@@ -3,6 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Sequence
 
+try:
+    from tqdm import tqdm
+    TQDM_AVAILABLE = True
+except ImportError:
+    TQDM_AVAILABLE = False
+
 from .loader import PATHRuntime
 from .mcp import JacobianStructure, NonlinearMCPResult, solve_nonlinear_mcp
 
@@ -27,10 +33,12 @@ class LinearCallbackData:
 @dataclass(frozen=True)
 class NonlinearCallbackData:
     variable_names: list[str]
+    expression_names: list[str]
     lb: list[float]
     ub: list[float]
     x0: list[float]
     jacobian_structure: JacobianStructure
+    jacobian_eval_mode: str
     callback_f: Callable[[Sequence[float]], list[float]]
     callback_jac: Callable[[Sequence[float]], list[float]]
 
@@ -101,6 +109,7 @@ class PyomoMCPAdapter:
         var_list = list(variables)
         if not var_list:
             raise ValueError("No variables provided/found for callback construction")
+        var_pos_by_name = {var.name: idx for idx, var in enumerate(var_list)}
 
         n = len(var_list)
         expr_list = list(expressions)
@@ -156,18 +165,14 @@ class PyomoMCPAdapter:
         model: Any,
         *,
         expressions: Sequence[Any],
+        expression_names: Sequence[str] | None = None,
         variables: Sequence[Any] | None = None,
+        jacobian_eval_mode: str = "symbolic",
     ) -> NonlinearCallbackData:
         """Build nonlinear residual and Jacobian callbacks from Pyomo expressions."""
         from pyomo.environ import Var, value
         from pyomo.core.expr.calculus.derivatives import Modes, differentiate
-
-        def _is_zero_derivative(expr: Any) -> bool:
-            if isinstance(expr, (int, float)):
-                return float(expr) == 0.0
-            if hasattr(expr, "is_constant") and expr.is_constant():
-                return float(value(expr)) == 0.0
-            return False
+        from pyomo.core.expr.visitor import identify_variables
 
         if variables is None:
             variables = sorted(
@@ -178,14 +183,27 @@ class PyomoMCPAdapter:
         var_list = list(variables)
         if not var_list:
             raise ValueError("No variables provided/found for callback construction")
+        var_pos_by_name = {var.name: idx for idx, var in enumerate(var_list)}
 
         expr_list = list(expressions)
         n = len(var_list)
+        jacobian_eval_mode = str(jacobian_eval_mode).strip().lower()
+        if jacobian_eval_mode not in {"symbolic", "reverse_numeric"}:
+            raise ValueError(f"Unsupported jacobian_eval_mode: {jacobian_eval_mode!r}")
         if len(expr_list) != n:
             raise ValueError(
                 "Expected one expression per variable. "
                 f"Got {len(expr_list)} expressions for {n} variables."
             )
+        if expression_names is None:
+            expr_names = [f"expr[{i}]" for i in range(len(expr_list))]
+        else:
+            expr_names = list(expression_names)
+            if len(expr_names) != len(expr_list):
+                raise ValueError(
+                    "Expression names must have the same length as expressions. "
+                    f"Got {len(expr_names)} names for {len(expr_list)} expressions."
+                )
 
         inf = 1.0e20
         lb: list[float] = []
@@ -201,17 +219,59 @@ class PyomoMCPAdapter:
             x0.append(float(st))
 
         jacobian_exprs: list[tuple[int, Any]] = []
+        jacobian_rows: list[tuple[int, Any, list[Any]]] = []
         column_rows: list[list[int]] = [[] for _ in range(n)]
+        row_variables: list[list[Any]] = [[] for _ in range(n)]
 
-        for j, var in enumerate(var_list):
-            for i, expr in enumerate(expr_list):
-                derivative = differentiate(expr, wrt=var, mode=Modes.reverse_symbolic)
-                if _is_zero_derivative(derivative):
+        # Build Jacobian sparsity pattern by identifying variables present in each
+        # equation. This avoids O(n_vars * n_eqs) symbolic differentiation just to
+        # discover structure.
+        print(f"\n🔍 Building Jacobian structure for {n:,} variables × {len(expr_list):,} equations...")
+        print("   (expression-driven sparsity detection)\n")
+
+        expr_iterator = tqdm(
+            enumerate(expr_list),
+            total=n,
+            desc="Processing equations",
+            unit="eq",
+            disable=not TQDM_AVAILABLE,
+        ) if TQDM_AVAILABLE else enumerate(expr_list)
+
+        nonzero_count = 0
+        for i, expr in expr_iterator:
+            seen_cols: set[int] = set()
+            for var in identify_variables(expr, include_fixed=False):
+                col = var_pos_by_name.get(var.name)
+                if col is None or col in seen_cols:
                     continue
-                column_rows[j].append(i + 1)
-                jacobian_exprs.append((i, derivative))
+                seen_cols.add(col)
+                column_rows[col].append(i + 1)
+                row_variables[i].append(var)
+                nonzero_count += 1
+
+            if TQDM_AVAILABLE and i % 100 == 0 and i > 0:
+                density = (nonzero_count / ((i + 1) * len(expr_list))) * 100
+                expr_iterator.set_postfix({"nonzeros": f"{nonzero_count:,}", "density": f"{density:.2f}%"})
+        
+        density_pct = (nonzero_count / (n * len(expr_list))) * 100
+        print(f"\n✅ Jacobian structure built: {nonzero_count:,} non-zero entries ({density_pct:.2f}% density)\n")
 
         structure = JacobianStructure.from_column_rows(column_rows)
+        if jacobian_eval_mode == "symbolic":
+            for j, var in enumerate(var_list):
+                for row_1based in column_rows[j]:
+                    jacobian_exprs.append(
+                        (
+                            row_1based - 1,
+                            differentiate(expr_list[row_1based - 1], wrt=var, mode=Modes.reverse_symbolic),
+                        )
+                    )
+        if jacobian_eval_mode == "reverse_numeric":
+            for i, expr in enumerate(expr_list):
+                vars_for_row = row_variables[i]
+                if not vars_for_row:
+                    continue
+                jacobian_rows.append((i, expr, vars_for_row))
 
         def _assign_values(x: Sequence[float]) -> None:
             if len(x) != n:
@@ -221,18 +281,56 @@ class PyomoMCPAdapter:
 
         def _callback_f(x: Sequence[float]) -> list[float]:
             _assign_values(x)
-            return [float(value(expr)) for expr in expr_list]
+            values_out: list[float] = []
+            for i, expr in enumerate(expr_list):
+                try:
+                    values_out.append(float(value(expr)))
+                except Exception as exc:
+                    vars_in_expr = sorted(
+                        {var.name: float(value(var)) for var in identify_variables(expr, include_fixed=True)}.items()
+                    )
+                    raise RuntimeError(
+                        f"Failed evaluating F[{i}] for {expr_names[i]}: {expr!s}; vars={vars_in_expr}"
+                    ) from exc
+            return values_out
 
         def _callback_jac(x: Sequence[float]) -> list[float]:
             _assign_values(x)
-            return [float(value(derivative)) for _i, derivative in jacobian_exprs]
+            if jacobian_eval_mode == "reverse_numeric":
+                row_maps: list[dict[int, float]] = [dict() for _ in range(n)]
+                for row_index, expr, vars_for_row in jacobian_rows:
+                    try:
+                        row_values = differentiate(expr, wrt_list=vars_for_row, mode=Modes.reverse_numeric)
+                    except Exception as exc:
+                        raise RuntimeError(
+                            f"Failed differentiating row {row_index} for {expr_names[row_index]}: {expr!s}"
+                        ) from exc
+                    row_maps[row_index] = {
+                        var_pos_by_name[var.name]: float(val) for var, val in zip(vars_for_row, row_values)
+                    }
+                values_out: list[float] = []
+                for j, _var in enumerate(var_list):
+                    for row_1based in column_rows[j]:
+                        values_out.append(row_maps[row_1based - 1][j])
+                return values_out
+            values_out: list[float] = []
+            for row_index, derivative in jacobian_exprs:
+                try:
+                    values_out.append(float(value(derivative)))
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Failed evaluating J row {row_index} for {expr_names[row_index]}: {expr_list[row_index]!s}"
+                    ) from exc
+            return values_out
 
         return NonlinearCallbackData(
             variable_names=[v.name for v in var_list],
+            expression_names=expr_names,
             lb=lb,
             ub=ub,
             x0=x0,
             jacobian_structure=structure,
+            jacobian_eval_mode=jacobian_eval_mode,
             callback_f=_callback_f,
             callback_jac=_callback_jac,
         )
@@ -260,6 +358,7 @@ class PyomoMCPAdapter:
             raise ValueError("No constraints provided")
 
         expressions: list[Any] = []
+        expression_names: list[str] = []
         inferred_vars_by_name: dict[str, Any] = {}
 
         for con in con_list:
@@ -271,6 +370,7 @@ class PyomoMCPAdapter:
             rhs = value(con.lower)
             expr = con.body - rhs
             expressions.append(expr)
+            expression_names.append(con.name)
 
             if variables is None:
                 repn = generate_standard_repn(expr, compute_values=False)
@@ -292,6 +392,7 @@ class PyomoMCPAdapter:
         *,
         constraints: Sequence[Any],
         variables: Sequence[Any] | None = None,
+        jacobian_eval_mode: str = "symbolic",
     ) -> NonlinearCallbackData:
         """Build nonlinear callbacks from Pyomo equality constraints."""
         from pyomo.environ import value
@@ -302,6 +403,7 @@ class PyomoMCPAdapter:
             raise ValueError("No constraints provided")
 
         expressions: list[Any] = []
+        expression_names: list[str] = []
         inferred_vars_by_name: dict[str, Any] = {}
 
         for con in con_list:
@@ -313,6 +415,7 @@ class PyomoMCPAdapter:
             rhs = value(con.lower)
             expr = con.body - rhs
             expressions.append(expr)
+            expression_names.append(con.name)
 
             if variables is None:
                 repn = generate_standard_repn(expr, compute_values=False)
@@ -326,7 +429,13 @@ class PyomoMCPAdapter:
         else:
             ordered_vars = list(variables)
 
-        return self.build_nonlinear_callbacks(model, expressions=expressions, variables=ordered_vars)
+        return self.build_nonlinear_callbacks(
+            model,
+            expressions=expressions,
+            expression_names=expression_names,
+            variables=ordered_vars,
+            jacobian_eval_mode=jacobian_eval_mode,
+        )
 
     def solve_nonlinear(
         self,
@@ -336,9 +445,15 @@ class PyomoMCPAdapter:
         expressions: Sequence[Any],
         variables: Sequence[Any] | None = None,
         output: bool = True,
+        jacobian_eval_mode: str = "symbolic",
     ) -> NonlinearMCPResult:
         """Build nonlinear callbacks from expressions and solve with PATH."""
-        data = self.build_nonlinear_callbacks(model, expressions=expressions, variables=variables)
+        data = self.build_nonlinear_callbacks(
+            model,
+            expressions=expressions,
+            variables=variables,
+            jacobian_eval_mode=jacobian_eval_mode,
+        )
         result = solve_nonlinear_mcp(
             runtime,
             n=len(data.variable_names),
@@ -361,12 +476,14 @@ class PyomoMCPAdapter:
         constraints: Sequence[Any],
         variables: Sequence[Any] | None = None,
         output: bool = True,
+        jacobian_eval_mode: str = "symbolic",
     ) -> NonlinearMCPResult:
         """Build nonlinear callbacks from equality constraints and solve with PATH."""
         data = self.build_nonlinear_from_equality_constraints(
             model,
             constraints=constraints,
             variables=variables,
+            jacobian_eval_mode=jacobian_eval_mode,
         )
         result = solve_nonlinear_mcp(
             runtime,

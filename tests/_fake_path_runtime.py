@@ -37,6 +37,7 @@ class FakePath:
         self.MCP_GetX = FakeCFunc(self._mcp_get_x)
 
         self.last_output_option: bytes | None = None
+        self.last_options: list[bytes] = []
         self.last_function_values: list[float] | None = None
         self.last_jacobian_values: list[float] | None = None
         self.last_row_indices: list[int] | None = None
@@ -57,6 +58,7 @@ class FakePath:
 
     def _options_set(self, _options, setting):
         self.last_output_option = setting
+        self.last_options.append(setting)
         return None
 
     def _mcp_create(self, n: int, nnz_capacity: int):

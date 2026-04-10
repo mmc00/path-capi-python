@@ -27,6 +27,7 @@ class PATHCAPIBridgeSolver(OptSolver):
         self._runtime: PATHRuntime | None = None
         self._constraints: Sequence[Any] | None = None
         self._variables: Sequence[Any] | None = None
+        self._jacobian_eval_mode = "symbolic"
         self._output = True
         self._adapter = PyomoMCPAdapter()
         self._callback_data: NonlinearCallbackData | None = None
@@ -56,6 +57,7 @@ class PATHCAPIBridgeSolver(OptSolver):
         lusol_lib = kwds.pop("lusol_lib", None)
         self._constraints = kwds.pop("constraints", None)
         self._variables = kwds.pop("variables", None)
+        self._jacobian_eval_mode = str(kwds.pop("jacobian_eval_mode", "symbolic"))
         self._output = bool(kwds.pop("output", getattr(self.options, "output", True)))
 
         if self._runtime is None:
@@ -80,6 +82,7 @@ class PATHCAPIBridgeSolver(OptSolver):
             self._model,
             constraints=constraints,
             variables=self._variables,
+            jacobian_eval_mode=self._jacobian_eval_mode,
         )
         self._solve_result = self._adapter.solve_nonlinear_from_equality_constraints(
             self._runtime,
@@ -87,6 +90,7 @@ class PATHCAPIBridgeSolver(OptSolver):
             constraints=constraints,
             variables=self._variables,
             output=self._output,
+            jacobian_eval_mode=self._jacobian_eval_mode,
         )
 
         return SimpleNamespace(rc=0, log="")
@@ -104,9 +108,14 @@ class PATHCAPIBridgeSolver(OptSolver):
         solver.status = SolverStatus.ok if self._solve_result.termination_code == 1 else SolverStatus.warning
         solver.return_code = self._solve_result.termination_code
         solver.termination_condition = term
-        solver.termination_message = f"PATH termination code {self._solve_result.termination_code}"
+        profile = self._solve_result.callback_profile
+        solver.termination_message = (
+            f"PATH termination code {self._solve_result.termination_code}; "
+            f"callback profile: F={profile.function_calls} calls/{profile.function_time_sec:.3f}s, "
+            f"J={profile.jacobian_calls} calls/{profile.jacobian_time_sec:.3f}s"
+        )
         solver.message = solver.termination_message
-        solver.wallclock_time = None
+        solver.wallclock_time = profile.total_callback_time_sec
 
         problem.name = getattr(self._model, "name", None)
         problem.number_of_objectives = 0

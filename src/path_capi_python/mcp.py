@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import ctypes
+import json
+import os
+import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Callable, Sequence
 
 from .loader import PATHRuntime
@@ -134,6 +138,97 @@ class NonlinearMCPResult:
     minor_iterations: int
     function_evaluations: int
     jacobian_evaluations: int
+    callback_profile: "CallbackProfile"
+
+
+@dataclass
+class CallbackProfile:
+    function_calls: int = 0
+    function_time_sec: float = 0.0
+    jacobian_calls: int = 0
+    jacobian_time_sec: float = 0.0
+    jacobian_function_reuse_calls: int = 0
+
+    @property
+    def total_callback_time_sec(self) -> float:
+        return self.function_time_sec + self.jacobian_time_sec
+
+
+@dataclass
+class ProgressSnapshot:
+    started_at: float
+    last_emit_at: float
+    interval_sec: float
+    path: Path | None
+    history_path: Path | None = None
+    latest_x: list[float] | None = None
+    latest_function_inf_norm: float | None = None
+    latest_function_l2_norm: float | None = None
+    latest_jacobian_inf_norm: float | None = None
+    latest_stage: str | None = None
+
+    def maybe_write(self, callback_profile: "CallbackProfile") -> None:
+        if self.path is None:
+            return
+        now = time.time()
+        if (now - self.last_emit_at) < self.interval_sec:
+            return
+        self.last_emit_at = now
+        self._write(callback_profile, finished=False)
+
+    def write_final(self, callback_profile: "CallbackProfile", *, finished: bool, termination_code: int | None) -> None:
+        if self.path is None:
+            return
+        self.last_emit_at = time.time()
+        self._write(callback_profile, finished=finished, termination_code=termination_code)
+
+    def _write(
+        self,
+        callback_profile: "CallbackProfile",
+        *,
+        finished: bool,
+        termination_code: int | None = None,
+    ) -> None:
+        if self.path is None:
+            return
+        payload = {
+            "started_at_epoch": self.started_at,
+            "updated_at_epoch": time.time(),
+            "elapsed_sec": time.time() - self.started_at,
+            "finished": finished,
+            "termination_code": termination_code,
+            "stage": self.latest_stage,
+            "function_calls": callback_profile.function_calls,
+            "function_time_sec": callback_profile.function_time_sec,
+            "jacobian_calls": callback_profile.jacobian_calls,
+            "jacobian_time_sec": callback_profile.jacobian_time_sec,
+            "jacobian_function_reuse_calls": callback_profile.jacobian_function_reuse_calls,
+            "total_callback_time_sec": callback_profile.total_callback_time_sec,
+            "latest_function_inf_norm": self.latest_function_inf_norm,
+            "latest_function_l2_norm": self.latest_function_l2_norm,
+            "latest_jacobian_inf_norm": self.latest_jacobian_inf_norm,
+            "latest_x_inf_norm": max(abs(v) for v in self.latest_x) if self.latest_x else None,
+            "latest_x": self.latest_x,
+        }
+        if self.path is not None:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self.path.with_suffix(self.path.suffix + ".tmp")
+            tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True))
+            tmp_path.replace(self.path)
+        if self.history_path is not None:
+            self.history_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.history_path.open("a", encoding="utf-8") as history_file:
+                history_file.write(json.dumps(payload, sort_keys=True))
+                history_file.write("\n")
+
+
+def _iter_path_option_strings(raw_value: str) -> list[bytes]:
+    option_lines: list[bytes] = []
+    for line in raw_value.replace(";", "\n").splitlines():
+        option = line.strip()
+        if option:
+            option_lines.append(option.encode("utf-8"))
+    return option_lines
 
 
 def _configure_path_functions(path: object) -> None:
@@ -177,6 +272,21 @@ def solve_nonlinear_mcp(
     c_ub = [float(value) for value in ub]
     c_x0 = [float(value) for value in x0]
     nnz = jacobian_structure.nnz
+    callback_profile = CallbackProfile()
+    progress_path_env = os.environ.get("PATH_CAPI_PROGRESS_FILE")
+    progress_history_path_env = os.environ.get("PATH_CAPI_PROGRESS_HISTORY_FILE")
+    progress_interval_env = os.environ.get("PATH_CAPI_PROGRESS_INTERVAL_SEC", "5")
+    try:
+        progress_interval_sec = max(float(progress_interval_env), 0.25)
+    except ValueError:
+        progress_interval_sec = 5.0
+    progress = ProgressSnapshot(
+        started_at=time.time(),
+        last_emit_at=0.0,
+        interval_sec=progress_interval_sec,
+        path=Path(progress_path_env).expanduser() if progress_path_env else None,
+        history_path=Path(progress_history_path_env).expanduser() if progress_history_path_env else None,
+    )
 
     def _read_x(size: int, x_ptr: ctypes.POINTER(ctypes.c_double)) -> list[float]:
         return [float(x_ptr[i]) for i in range(size)]
@@ -195,19 +305,32 @@ def solve_nonlinear_mcp(
 
     @CB_FUNCTION
     def _function(_id, size, x_ptr, f_ptr):
-        values = list(callback_f(_read_x(size, x_ptr)))
+        x_values = _read_x(size, x_ptr)
+        started_at = time.perf_counter()
+        values = list(callback_f(x_values))
+        callback_profile.function_calls += 1
+        callback_profile.function_time_sec += time.perf_counter() - started_at
         if len(values) != size:
             raise ValueError(f"callback_f returned {len(values)} values, expected {size}")
         for i, value in enumerate(values):
             f_ptr[i] = float(value)
+        progress.latest_stage = "function"
+        progress.latest_x = x_values
+        progress.latest_function_inf_norm = max(abs(float(v)) for v in values) if values else 0.0
+        progress.latest_function_l2_norm = sum(float(v) * float(v) for v in values) ** 0.5 if values else 0.0
+        progress.maybe_write(callback_profile)
         return 0
 
     @CB_JACOBIAN
     def _jacobian(_id, size, x_ptr, wantf, f_ptr, nnz_ptr, col_ptr, len_ptr, row_ptr, data_ptr):
+        started_at = time.perf_counter()
         if wantf > 0:
+            callback_profile.jacobian_function_reuse_calls += 1
             _function(_id, size, x_ptr, f_ptr)
-
-        values = list(callback_jac(_read_x(size, x_ptr)))
+        x_values = _read_x(size, x_ptr)
+        values = list(callback_jac(x_values))
+        callback_profile.jacobian_calls += 1
+        callback_profile.jacobian_time_sec += time.perf_counter() - started_at
         if len(values) != nnz:
             raise ValueError(f"callback_jac returned {len(values)} values, expected {nnz}")
 
@@ -218,6 +341,10 @@ def solve_nonlinear_mcp(
         for k, row in enumerate(jacobian_structure.row_indices):
             row_ptr[k] = row
             data_ptr[k] = float(values[k])
+        progress.latest_stage = "jacobian"
+        progress.latest_x = x_values
+        progress.latest_jacobian_inf_norm = max(abs(float(v)) for v in values) if values else 0.0
+        progress.maybe_write(callback_profile)
         return 0
 
     callbacks = (_problem_size, _bounds, _function, _jacobian)
@@ -231,6 +358,8 @@ def solve_nonlinear_mcp(
     path.Path_AddOptions(options)
     path.Options_Default(options)
     path.Options_Set(options, b"output yes" if output else b"output no")
+    for option in _iter_path_option_strings(os.environ.get("PATH_CAPI_OPTIONS", "")):
+        path.Options_Set(options, option)
 
     mcp = path.MCP_Create(n, max(nnz, 1))
     if not mcp:
@@ -262,6 +391,8 @@ def solve_nonlinear_mcp(
     term = int(path.Path_Solve(mcp, ctypes.byref(info)))
     x_ptr = path.MCP_GetX(mcp)
     x_sol = [float(x_ptr[i]) for i in range(n)]
+    progress.latest_x = x_sol
+    progress.write_final(callback_profile, finished=True, termination_code=term)
 
     path.MCP_Destroy(mcp)
     path.Options_Destroy(options)
@@ -276,6 +407,7 @@ def solve_nonlinear_mcp(
         minor_iterations=int(info.minor_iterations),
         function_evaluations=int(info.function_evaluations),
         jacobian_evaluations=int(info.jacobian_evaluations),
+        callback_profile=callback_profile,
     )
 
 

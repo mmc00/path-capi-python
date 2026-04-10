@@ -32,6 +32,7 @@ def test_solver_factory_path_capi_bridge_solves_model_and_returns_results() -> N
     assert results.solver[0].status == SolverStatus.ok
     assert results.solver[0].termination_condition == TerminationCondition.optimal
     assert results.solver[0].return_code == 1
+    assert "callback profile" in str(results.solver[0].message)
     assert results.problem[0].number_of_variables == 2
     assert results.problem[0].number_of_constraints == 2
     assert results.problem[0].number_of_nonzeros == 3

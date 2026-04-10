@@ -61,6 +61,31 @@ def test_build_nonlinear_callbacks() -> None:
     assert data.callback_jac([1.5, 0.5]) == [3.0, 1.0, 2.0]
 
 
+def test_build_nonlinear_callbacks_reverse_numeric_mode() -> None:
+    model = ConcreteModel()
+    model.x1 = Var(bounds=(0.0, None), initialize=1.5)
+    model.x2 = Var(bounds=(0.0, 4.0), initialize=0.5)
+
+    expressions = [
+        model.x1**2 - 3.0,
+        model.x1 + 2.0 * model.x2 - 2.0,
+    ]
+
+    adapter = PyomoMCPAdapter()
+    data = adapter.build_nonlinear_callbacks(
+        model,
+        expressions=expressions,
+        variables=[model.x1, model.x2],
+        jacobian_eval_mode="reverse_numeric",
+    )
+
+    assert data.jacobian_eval_mode == "reverse_numeric"
+    assert data.jacobian_structure.col_starts == [1, 3]
+    assert data.jacobian_structure.col_lengths == [2, 1]
+    assert data.jacobian_structure.row_indices == [1, 2, 2]
+    assert data.callback_jac([1.5, 0.5]) == pytest.approx([3.0, 1.0, 2.0])
+
+
 def test_solve_nonlinear_from_expressions() -> None:
     model = ConcreteModel()
     model.x1 = Var(bounds=(0.0, None), initialize=1.5)
