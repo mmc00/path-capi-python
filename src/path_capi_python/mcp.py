@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable, Sequence
 
 from .loader import PATHRuntime
+from .output_hook import install_output_hook
 
 
 CB_PROBLEM_SIZE = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int))
@@ -352,6 +353,29 @@ def solve_nonlinear_mcp(
     path = runtime.path
     _configure_path_functions(path)
 
+    # Output hook — capture PATH's diagnostic messages (factorization
+    # method confirmation, license check results, basis state, etc.)
+    # via the Output_SetInterface callback. Without this, PATH's
+    # default sink absorbs all messages silently.
+    #
+    # Controlled by env var PATH_CAPI_OUTPUT_HOOK:
+    #   "off"       — do not install (legacy behavior)
+    #   "stderr"    — install, echo to stderr (default when output=True)
+    #   "capture"   — install, only capture (no echo)
+    output_hook_mode = os.environ.get("PATH_CAPI_OUTPUT_HOOK", "stderr" if output else "off").lower()
+    output_hook_handle = None
+    if output_hook_mode != "off":
+        try:
+            output_hook_handle = install_output_hook(
+                runtime,
+                echo_to_stderr=(output_hook_mode == "stderr"),
+                capture=True,
+            )
+        except RuntimeError:
+            # PATH library too old to support Output_SetInterface; warn once
+            # and continue without the hook so legacy installs still work.
+            output_hook_handle = None
+
     options = path.Options_Create()
     if not options:
         raise RuntimeError("Options_Create returned null")
@@ -398,6 +422,7 @@ def solve_nonlinear_mcp(
     path.Options_Destroy(options)
 
     _ = callbacks
+    _ = output_hook_handle  # keep callbacks alive through PATH internals
 
     return NonlinearMCPResult(
         termination_code=term,
