@@ -168,8 +168,14 @@ class PyomoMCPAdapter:
         expression_names: Sequence[str] | None = None,
         variables: Sequence[Any] | None = None,
         jacobian_eval_mode: str = "symbolic",
+        constraint_objects: Sequence[Any] | None = None,
     ) -> NonlinearCallbackData:
-        """Build nonlinear residual and Jacobian callbacks from Pyomo expressions."""
+        """Build nonlinear residual and Jacobian callbacks from Pyomo expressions.
+
+        `constraint_objects` are the Pyomo Constraint data objects the expressions
+        came from, in the same order. Only the "asl" mode needs them: the .nl
+        writer reorders rows, so they are what lets us map ASL's rows back to ours.
+        """
         from pyomo.environ import Var, value
         from pyomo.core.expr.calculus.derivatives import Modes, differentiate
         from pyomo.core.expr.visitor import identify_variables
@@ -188,7 +194,7 @@ class PyomoMCPAdapter:
         expr_list = list(expressions)
         n = len(var_list)
         jacobian_eval_mode = str(jacobian_eval_mode).strip().lower()
-        if jacobian_eval_mode not in {"symbolic", "reverse_numeric"}:
+        if jacobian_eval_mode not in {"symbolic", "reverse_numeric", "asl"}:
             raise ValueError(f"Unsupported jacobian_eval_mode: {jacobian_eval_mode!r}")
         if len(expr_list) != n:
             raise ValueError(
@@ -273,6 +279,109 @@ class PyomoMCPAdapter:
                     continue
                 jacobian_rows.append((i, expr, vars_for_row))
 
+        # --- Evaluador ASL (PyNumero) ---------------------------------------
+        # `differentiate()` recorre y deriva el arbol de expresiones en Python en
+        # CADA llamada; el propio Pyomo advierte que "this is certainly not as
+        # efficient as doing AD in C or C++". PyomoNLP delega en la AMPL Solver
+        # Library: medido sobre el GTAP 20x41, 6.38s -> 0.032s por llamada (200x).
+        #
+        # El escritor .nl impone SU PROPIO orden de variables y filas. En el
+        # 20x41, 0 de 210,094 filas y 0 de 210,094 columnas coinciden con el
+        # orden del adaptador, asi que hay que permutar: sin eso el Jacobiano
+        # sale completo pero traspuesto de sitio, y PATH converge a otra raiz
+        # sin emitir ningun error. La permutacion se construye una vez (79 ms a
+        # 210k) y es una biyeccion: los CONJUNTOS de variables y filas coinciden.
+        asl_state: dict[str, Any] = {}
+        if jacobian_eval_mode == "asl":
+            if constraint_objects is None or len(constraint_objects) != len(expr_list):
+                raise ValueError(
+                    "jacobian_eval_mode='asl' requires constraint_objects aligned "
+                    "with expressions (the .nl writer reorders rows, so the row "
+                    "mapping cannot be inferred from expressions alone)"
+                )
+            import numpy as _np
+            from pyomo.common.modeling import unique_component_name
+            from pyomo.environ import Objective
+            from pyomo.contrib.pynumero.interfaces.pyomo_nlp import PyomoNLP
+
+            # PyomoNLP exige exactamente un objetivo. Un MCP es cuadrado y no
+            # tiene ninguno; el propio NotImplementedError de Pyomo indica "add a
+            # dummy objective (f(x)=0) if you have a square problem", y Pyomo usa
+            # este mismo patron internamente (p.ej. cyipopt_solver.py).
+            n_obj = sum(1 for _ in model.component_data_objects(Objective, active=True))
+            obj_name = None
+            if n_obj == 0:
+                obj_name = unique_component_name(model, "_path_capi_asl_obj")
+                model.add_component(obj_name, Objective(expr=0.0))
+            try:
+                nlp = PyomoNLP(model)
+            finally:
+                if obj_name is not None:
+                    model.del_component(obj_name)
+
+            asl_vars = nlp.get_pyomo_variables()
+            asl_cons = nlp.get_pyomo_constraints()
+            if len(asl_vars) != n or len(asl_cons) != len(expr_list):
+                raise ValueError(
+                    "ASL mode requires the model to contain exactly the requested "
+                    f"variables/constraints: ASL sees {len(asl_vars)}x{len(asl_cons)}, "
+                    f"adapter requested {n}x{len(expr_list)}"
+                )
+
+            asl_col_of = {id(v): j for j, v in enumerate(asl_vars)}
+            asl_row_of = {id(c): i for i, c in enumerate(asl_cons)}
+            try:
+                # col_perm[j] = columna en ASL de nuestra variable j
+                col_perm = _np.fromiter(
+                    (asl_col_of[id(v)] for v in var_list), dtype=_np.int64, count=n
+                )
+                # row_of_asl[i_asl] = nuestra fila para la fila i de ASL
+                row_of_asl = _np.empty(len(asl_cons), dtype=_np.int64)
+                for our_i, con in enumerate(constraint_objects):
+                    row_of_asl[asl_row_of[id(con)]] = our_i
+            except KeyError as exc:
+                raise ValueError(
+                    "ASL mode requires every adapter variable/constraint to be part "
+                    "of the model written to .nl; missing component"
+                ) from exc
+
+            # inversa: nuestra columna j -> posicion, para mapear J de ASL a la nuestra
+            our_col_of_asl = _np.empty(n, dtype=_np.int64)
+            our_col_of_asl[col_perm] = _np.arange(n, dtype=_np.int64)
+
+            J0 = nlp.evaluate_jacobian().tocoo()
+            asl_state["nlp"] = nlp
+            asl_state["out"] = J0.copy()
+            asl_state["row_of_asl"] = row_of_asl
+            asl_state["our_col_of_asl"] = our_col_of_asl
+            asl_state["np"] = _np
+
+            # Estructura de dispersion en NUESTRO indexado, derivada de la de ASL.
+            # PATH quiere los datos columna por columna y, dentro de cada columna,
+            # por fila creciente. Un lexsort sobre (fila, columna) da ese orden de
+            # una vez: buscar columna por columna seria O(n*nnz) — a 210k columnas
+            # y 1.2M no-ceros, minutos en vez de milisegundos.
+            rows_ours = row_of_asl[J0.row]
+            cols_ours = our_col_of_asl[J0.col]
+            take_flat = _np.lexsort((rows_ours, cols_ours))
+            sorted_rows = rows_ours[take_flat]
+            sorted_cols = cols_ours[take_flat]
+            counts = _np.bincount(sorted_cols, minlength=n)
+            column_rows: list[list[int]] = []
+            at = 0
+            for j in range(n):
+                k = int(counts[j])
+                column_rows.append((sorted_rows[at : at + k] + 1).tolist())
+                at += k
+
+            # x llega en NUESTRO orden; set_primals lo quiere en el de ASL.
+            # asl_x[col_perm[j]] = x[j]  =>  asl_x = x[permutacion inversa]
+            x_perm = _np.empty(n, dtype=_np.int64)
+            x_perm[col_perm] = _np.arange(n, dtype=_np.int64)
+            asl_state["col_perm_x"] = x_perm
+            asl_state["take_flat"] = take_flat
+            structure = JacobianStructure.from_column_rows(column_rows)
+
         def _assign_values(x: Sequence[float]) -> None:
             if len(x) != n:
                 raise ValueError(f"Expected {n} values, got {len(x)}")
@@ -296,6 +405,13 @@ class PyomoMCPAdapter:
 
         def _callback_jac(x: Sequence[float]) -> list[float]:
             _assign_values(x)
+            if jacobian_eval_mode == "asl":
+                _np = asl_state["np"]
+                nlp = asl_state["nlp"]
+                out = asl_state["out"]
+                nlp.set_primals(_np.asarray(x, dtype=float)[asl_state["col_perm_x"]])
+                nlp.evaluate_jacobian(out=out)
+                return out.data[asl_state["take_flat"]].tolist()
             if jacobian_eval_mode == "reverse_numeric":
                 row_maps: list[dict[int, float]] = [dict() for _ in range(n)]
                 for row_index, expr, vars_for_row in jacobian_rows:
@@ -404,6 +520,7 @@ class PyomoMCPAdapter:
 
         expressions: list[Any] = []
         expression_names: list[str] = []
+        active_cons: list[Any] = []
         inferred_vars_by_name: dict[str, Any] = {}
 
         for con in con_list:
@@ -416,6 +533,7 @@ class PyomoMCPAdapter:
             expr = con.body - rhs
             expressions.append(expr)
             expression_names.append(con.name)
+            active_cons.append(con)
 
             if variables is None:
                 repn = generate_standard_repn(expr, compute_values=False)
@@ -435,6 +553,7 @@ class PyomoMCPAdapter:
             expression_names=expression_names,
             variables=ordered_vars,
             jacobian_eval_mode=jacobian_eval_mode,
+            constraint_objects=active_cons,
         )
 
     def solve_nonlinear(
