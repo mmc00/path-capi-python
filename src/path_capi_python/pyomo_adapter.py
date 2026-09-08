@@ -380,6 +380,11 @@ class PyomoMCPAdapter:
             x_perm[col_perm] = _np.arange(n, dtype=_np.int64)
             asl_state["col_perm_x"] = x_perm
             asl_state["take_flat"] = take_flat
+            # F(x): ASL devuelve g(x) en SU orden de filas; row_of_asl lo lleva al
+            # nuestro. Sale del mismo cache que el Jacobiano, asi que cuando PATH
+            # pide F y J en el mismo punto el segundo es casi gratis.
+            asl_state["g_out"] = nlp.evaluate_constraints()
+            asl_state["f_perm"] = _np.argsort(row_of_asl, kind="stable")
             structure = JacobianStructure.from_column_rows(column_rows)
 
         def _assign_values(x: Sequence[float]) -> None:
@@ -389,6 +394,13 @@ class PyomoMCPAdapter:
                 var.set_value(float(val), skip_validation=True)
 
         def _callback_f(x: Sequence[float]) -> list[float]:
+            if jacobian_eval_mode == "asl":
+                _np = asl_state["np"]
+                nlp = asl_state["nlp"]
+                g = asl_state["g_out"]
+                nlp.set_primals(_np.asarray(x, dtype=float)[asl_state["col_perm_x"]])
+                nlp.evaluate_constraints(out=g)
+                return g[asl_state["f_perm"]].tolist()
             _assign_values(x)
             values_out: list[float] = []
             for i, expr in enumerate(expr_list):

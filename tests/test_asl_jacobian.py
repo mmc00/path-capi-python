@@ -140,3 +140,92 @@ def test_asl_agrees_with_reverse_numeric_mode():
     assert list(a.jacobian_structure.row_indices) == list(b.jacobian_structure.row_indices)
     for u, v in zip(a.callback_jac(x), b.callback_jac(x)):
         assert abs(float(u) - float(v)) < 1e-9
+
+
+@requires_asl
+def test_asl_residual_matches_python_evaluation():
+    """F(x) via ASL == F(x) via Pyomo's value(), under the adapter's own order."""
+    m = _ces_model()
+    adapter = PyomoMCPAdapter()
+    cons = list(m.eq.values())
+    varlist = list(reversed(list(m.x.values())))  # deliberately not the .nl order
+
+    data = adapter.build_nonlinear_from_equality_constraints(
+        m, constraints=cons, variables=varlist, jacobian_eval_mode="asl"
+    )
+    x = [float(value(v)) for v in varlist]
+    got = list(data.callback_f(x))
+
+    for v, xv in zip(varlist, x):
+        v.set_value(xv, skip_validation=True)
+    expected = [float(value(c.body - value(c.lower))) for c in cons]
+
+    assert len(got) == len(expected)
+    for i, (a, b) in enumerate(zip(got, expected)):
+        assert abs(a - b) < 1e-9, f"row {i}: {a} vs {b}"
+
+
+@requires_asl
+def test_asl_residual_tracks_the_point():
+    """A different x must give a different F — guards against a stale cache."""
+    m = _ces_model()
+    adapter = PyomoMCPAdapter()
+    cons = list(m.eq.values())
+    varlist = list(m.x.values())
+
+    data = adapter.build_nonlinear_from_equality_constraints(
+        m, constraints=cons, variables=varlist, jacobian_eval_mode="asl"
+    )
+    x0 = [float(value(v)) for v in varlist]
+    f0 = list(data.callback_f(x0))
+    x1 = [v * 1.05 for v in x0]
+    f1 = list(data.callback_f(x1))
+    assert any(abs(a - b) > 1e-9 for a, b in zip(f0, f1)), "F did not follow x"
+
+    # and going back reproduces the original values
+    f0b = list(data.callback_f(x0))
+    for a, b in zip(f0, f0b):
+        assert abs(a - b) < 1e-12
+
+
+@requires_asl
+def test_asl_residual_is_not_a_python_walk():
+    """In "asl" mode F(x) must come from ASL, not from Pyomo's Python walker.
+
+    Both give the same numbers, so correctness cannot tell them apart. What
+    separates them is cost: the Python walk is O(expression tree) per row, ASL
+    is one C call. On a model wide enough for the gap to clear timing noise,
+    asl must be decisively faster than reverse_numeric — which walks the same
+    trees the old residual did.
+
+    Profiling one gtap7_20x41 solve put 29% of the time in that walk, against
+    the Jacobian's 17%: after moving J to ASL, F became the larger half.
+    """
+    import time
+
+    m = _ces_model(n=400)
+    adapter = PyomoMCPAdapter()
+    cons = list(m.eq.values())
+    varlist = list(m.x.values())
+    x = [float(value(v)) for v in varlist]
+
+    slow = adapter.build_nonlinear_from_equality_constraints(
+        m, constraints=cons, variables=varlist, jacobian_eval_mode="reverse_numeric"
+    )
+    fast = adapter.build_nonlinear_from_equality_constraints(
+        m, constraints=cons, variables=varlist, jacobian_eval_mode="asl"
+    )
+
+    for a, b in zip(slow.callback_f(x), fast.callback_f(x)):
+        assert abs(float(a) - float(b)) < 1e-9
+
+    def best(fn, reps=5):
+        fn(x)
+        return min((lambda t0: (fn(x), time.perf_counter() - t0)[1])(time.perf_counter())
+                   for _ in range(reps))
+
+    t_slow = best(slow.callback_f)
+    t_fast = best(fast.callback_f)
+    assert t_fast * 3 < t_slow, (
+        f"asl residual {t_fast:.5f}s vs python {t_slow:.5f}s — not the C path"
+    )
