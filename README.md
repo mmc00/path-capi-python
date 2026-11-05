@@ -16,11 +16,45 @@ The project is designed to:
 
 This repository wraps the PATH C API. It does not reimplement the PATH solver.
 
+## Installation
+
+```bash
+pip install path-capi-python            # C API wrapper only
+pip install "path-capi-python[pyomo]"   # with the Pyomo adapter
+```
+
+The package does **not** ship the PATH solver itself. Download the PATH shared
+libraries from the PATH authors and point the wrapper at them:
+
+| platform | files (from <https://pages.cs.wisc.edu/~ferris/path/julia/>) |
+|---|---|
+| macOS arm64 | `libpath50.silicon.dylib`, `liblusol.silicon.dylib` |
+| macOS x86_64 | `libpath50.dylib`, `liblusol.dylib` |
+| Linux x86_64 | `libpath50.so`, `liblusol.so` |
+| Windows | `path50.dll`, `lusol.dll` |
+
+```bash
+export PATH_CAPI_LIBPATH=/absolute/path/to/libpath50.silicon.dylib
+export PATH_CAPI_LIBLUSOL=/absolute/path/to/liblusol.silicon.dylib
+```
+
 ## PATH Licensing
 
 This project is MIT-licensed for the wrapper code only.
 The underlying PATH solver is distributed under its own terms.
 Users are responsible for obtaining and complying with PATH licensing requirements.
+
+Without a license string PATH runs in demonstration mode: at most **300 variables
+and 2,000 nonzeros**. The PATH authors publish a free evaluation license that
+removes the size limit for a period of time; it is in the `LICENSE` file at
+<https://pages.cs.wisc.edu/~ferris/path/julia/LICENSE>. Set it before solving:
+
+```bash
+export PATH_LICENSE_STRING="<string from that LICENSE file>"
+```
+
+You can check what your runtime allows with
+`PATHLoader.check_license(runtime, n_vars, nnz)`.
 
 ## Initial Roadmap
 
@@ -41,14 +75,7 @@ Users are responsible for obtaining and complying with PATH licensing requiremen
 
 ## Runtime Setup
 
-Point the wrapper at your local PATH shared libraries:
-
-```bash
-export PATH_CAPI_LIBPATH=/absolute/path/to/libpath.dylib
-export PATH_CAPI_LIBLUSOL=/absolute/path/to/liblusol.dylib
-```
-
-Verify the runtime first:
+With the libraries set up as in [Installation](#installation), verify the runtime first:
 
 ```bash
 PYTHONPATH=src python3 examples/check_runtime.py

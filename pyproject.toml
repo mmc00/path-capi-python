@@ -5,26 +5,40 @@ build-backend = "hatchling.build"
 [project]
 name = "path-capi-python"
 version = "0.1.0"
-description = "Python wrapper for the PATH C API with Apple Silicon support"
+description = "Python wrapper for the PATH C API (MCP/LCP) with Apple Silicon support and an optional Pyomo adapter"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-  { name = "path-capi-python contributors" }
+  { name = "Marlon Molina", email = "dracomarmol@gmail.com" }
 ]
 keywords = ["PATH", "MCP", "LCP", "complementarity", "optimization"]
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: Mathematics",
   "License :: OSI Approved :: MIT License",
   "Operating System :: MacOS",
   "Operating System :: POSIX :: Linux",
 ]
 
+[project.urls]
+Homepage = "https://github.com/mmc00/path-capi-python"
+Repository = "https://github.com/mmc00/path-capi-python"
+Issues = "https://github.com/mmc00/path-capi-python/issues"
+
 [project.optional-dependencies]
+pyomo = [
+  "pyomo>=6.7",
+]
 dev = [
   "pytest>=8.0",
 ]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/", "tests/", "examples/", "README.md", "LICENSE"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
