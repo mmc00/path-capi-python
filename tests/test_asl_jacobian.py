@@ -229,3 +229,42 @@ def test_asl_residual_is_not_a_python_walk():
     assert t_fast * 3 < t_slow, (
         f"asl residual {t_fast:.5f}s vs python {t_slow:.5f}s — not the C path"
     )
+
+
+@requires_asl
+def test_build_does_not_key_sparsity_on_var_name():
+    """Sparsity detection must look variables up by identity, not by name.
+
+    `var.name` builds the fully-qualified string ("eq[3]", "x[7]") on every
+    access — it is not cached. Tracing one gtap7_20x41 build counted 9.7M calls
+    to getname, 4.59M of them from this one loop: the single largest consumer of
+    component names in the whole run.
+    """
+    from pyomo.core.base.component import ComponentData
+
+    m = _ces_model(n=150)
+    adapter = PyomoMCPAdapter()
+    cons = list(m.eq.values())
+    varlist = list(m.x.values())
+
+    calls = {"n": 0}
+    original = ComponentData.getname
+
+    def counting(self, *a, **kw):
+        calls["n"] += 1
+        return original(self, *a, **kw)
+
+    ComponentData.getname = counting
+    try:
+        adapter.build_nonlinear_from_equality_constraints(
+            m, constraints=cons, variables=varlist, jacobian_eval_mode="asl"
+        )
+    finally:
+        ComponentData.getname = original
+
+    # One name per constraint (expression_names) is legitimate; a name per
+    # (row, variable) pair is the bug — that scales with the nonzero count.
+    assert calls["n"] < 4 * len(cons), (
+        f"{calls['n']:,} getname calls for {len(cons)} rows — sparsity detection "
+        "is still keyed on var.name instead of id(var)"
+    )

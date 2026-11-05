@@ -190,6 +190,12 @@ class PyomoMCPAdapter:
         if not var_list:
             raise ValueError("No variables provided/found for callback construction")
         var_pos_by_name = {var.name: idx for idx, var in enumerate(var_list)}
+        # `var.name` rebuilds the fully-qualified string on every access — it is
+        # never cached. Keyed by name, the sparsity scan below called getname
+        # once per (row, variable) pair: 4.59M times on gtap7_20x41, the single
+        # largest consumer of component names in the run. Identity is what the
+        # scan actually needs.
+        var_pos_by_id = {id(var): idx for idx, var in enumerate(var_list)}
 
         expr_list = list(expressions)
         n = len(var_list)
@@ -247,7 +253,7 @@ class PyomoMCPAdapter:
         for i, expr in expr_iterator:
             seen_cols: set[int] = set()
             for var in identify_variables(expr, include_fixed=False):
-                col = var_pos_by_name.get(var.name)
+                col = var_pos_by_id.get(id(var))
                 if col is None or col in seen_cols:
                     continue
                 seen_cols.add(col)
