@@ -79,3 +79,22 @@ def test_solve_nonlinear_from_equality_constraints() -> None:
     assert model.x2.value == pytest.approx(2.0)
     assert fake_path.last_function_values == [-0.75, 0.5]
     assert fake_path.last_jacobian_values == [3.0, 1.0, 2.0]
+
+
+def test_inferred_variables_include_ones_that_only_appear_quadratically() -> None:
+    """A variable that appears only as x**2 must still be inferred.
+
+    standard_repn files a pure square under quadratic_vars, not linear_vars or
+    nonlinear_vars; inferring from those two alone drops the variable and the
+    system stops being square.
+    """
+    model = ConcreteModel()
+    model.x1 = Var(initialize=1.0)
+    model.x2 = Var(initialize=1.0)
+    model.c1 = Constraint(expr=model.x1**2 - 4.0 == 0.0)
+    model.c2 = Constraint(expr=model.x1 + model.x2**2 - 3.0 == 0.0)
+
+    adapter = PyomoMCPAdapter()
+    data = adapter.build_nonlinear_from_equality_constraints(model, constraints=[model.c1, model.c2])
+
+    assert data.variable_names == ["x1", "x2"]

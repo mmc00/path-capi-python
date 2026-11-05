@@ -557,6 +557,11 @@ class PyomoMCPAdapter:
                 repn = generate_standard_repn(expr, compute_values=False)
                 for var in repn.linear_vars or []:
                     inferred_vars_by_name[var.name] = var
+                # A pure square (x**2) lands in quadratic_vars as an (x, x) pair,
+                # in neither of the other two lists.
+                for pair in getattr(repn, "quadratic_vars", None) or []:
+                    for var in pair:
+                        inferred_vars_by_name[var.name] = var
                 for var in getattr(repn, "nonlinear_vars", None) or []:
                     inferred_vars_by_name[var.name] = var
 
